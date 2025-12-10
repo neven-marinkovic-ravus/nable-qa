@@ -758,6 +758,11 @@ def main() -> None:
         default="pricing_only",
         help="Column that flags rows to only create pricing records (no account product or contract rate creation).",
     )
+    parser.add_argument(
+        "--bundle-component-column",
+        default="bundle_component",
+        help="Column that flags rows whose account products should be created without contract rate or pricing.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     args = parser.parse_args()
 
@@ -1159,6 +1164,7 @@ def main() -> None:
         processed_currencies: Set[str] = set(created_contract_currencies.keys())
 
         pricing_only_column = args.pricing_only_column
+        bundle_component_column = args.bundle_component_column
         product_groups: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
         for row in grouped_rows:
             product_name = row.get(args.product_column)
@@ -1189,11 +1195,19 @@ def main() -> None:
                     )
                     continue
 
-            non_pricing_only_rows = [r for r in product_rows if not parse_bool(r.get(pricing_only_column))]
+            bundle_rows = [r for r in product_rows if parse_bool(r.get(bundle_component_column))]
+            pricing_driving_rows = [r for r in product_rows if not parse_bool(r.get(bundle_component_column))]
+            non_pricing_only_rows = [r for r in pricing_driving_rows if not parse_bool(r.get(pricing_only_column))]
             contract_rate_response: Optional[Dict] = None
             contract_rate_id: Optional[str] = None
 
-            if non_pricing_only_rows:
+            if not pricing_driving_rows:
+                LOGGER.info(
+                    "All rows for product '%s' in contract '%s' are bundle components; skipping contract rate and pricing.",
+                    product_name,
+                    contract_key,
+                )
+            elif non_pricing_only_rows:
                 LOGGER.info("Creating contract rate for contract %s, product %s", contract_id, product_id)
                 try:
                     contract_rate_response = create_contract_rate(api_base, session_id, contract_id, product_id)
@@ -1243,7 +1257,7 @@ def main() -> None:
                     )
                     continue
 
-            if not contract_rate_id:
+            if pricing_driving_rows and not contract_rate_id:
                 LOGGER.error(
                     "No contract rate Id resolved for product '%s' in contract '%s'; skipping product.",
                     product_name,
@@ -1310,121 +1324,169 @@ def main() -> None:
                         exc,
                     )
 
-            existing_pricing_entries = find_pricing_entries(api_base, session_id, contract_rate_id)
-            existing_pricing_index: Dict[Tuple[str, Optional[Decimal], Optional[Decimal]], Dict] = {}
-            for entry in existing_pricing_entries:
-                entry_currency = entry.get("CurrencyCode") or entry.get("currencycode") or product_currency_code
-                lower_band_value = parse_pricing_band(entry.get("LowerBand") or entry.get("lowerband"))
-                upper_band_value = parse_pricing_band(entry.get("UpperBand") or entry.get("upperband"))
-                key = (entry_currency, lower_band_value, upper_band_value)
-                existing_pricing_index[key] = entry
+            # Account products for bundle component rows (always create; no contract rate/pricing).
+            for row in bundle_rows:
+                row_start_date = parse_date(row.get(args.start_date_column), fallback=start_date_value)
+                account_product_status = row.get(args.account_product_status_column) or "Active"
+                quantity_value = parse_quantity(row.get(args.quantity_column))
+                LOGGER.info(
+                    "Creating bundle component account product '%s' for contract %s (account %s); skipping rate/pricing.",
+                    product_name,
+                    contract_id,
+                    account_id,
+                )
+                try:
+                    response = create_account_product(
+                        api_base,
+                        session_id,
+                        account_id,
+                        contract_id,
+                        product_id,
+                        row_start_date,
+                        quantity_value,
+                        account_product_status,
+                    )
+                    account_product_responses.append({"bundle_component": True, "response": response})
+                except ApiTimeout as timeout_exc:
+                    LOGGER.warning(
+                        "Bundle component account product creation for '%s' timed out; verifying record: %s",
+                        product_name,
+                        timeout_exc,
+                    )
+                    records = find_account_product(api_base, session_id, contract_id, product_id)
+                    if records:
+                        account_product_responses.append({"bundle_component": True, "queryResponse": records})
+                    else:
+                        LOGGER.error(
+                            "Bundle component account product '%s' not found after timeout for contract '%s'",
+                            product_name,
+                            contract_key,
+                        )
+                except Exception as exc:
+                    LOGGER.error(
+                        "Bundle component account product creation failed for '%s' in contract '%s': %s",
+                        product_name,
+                        contract_key,
+                        exc,
+                    )
 
+            existing_pricing_entries = find_pricing_entries(api_base, session_id, contract_rate_id) if contract_rate_id else []
+            existing_pricing_index: Dict[Tuple[str, Optional[Decimal], Optional[Decimal]], Dict] = {}
             pricing_payload_entries: List[Dict[str, str]] = []
             skipped_existing: List[Dict[str, Any]] = []
+            canonical_tiers: List[Dict[str, Decimal]] = []
 
-            for row in product_rows:
-                row_effective_date = parse_date(row.get(args.effective_date_column), fallback=parse_date(row.get(args.start_date_column), fallback=start_date_value))
-                row_end_date = parse_optional_date(row.get(args.end_date_column))
-                effective_iso = f"{row_effective_date.isoformat()}T00:00:00.000Z"
-                end_date_iso = f"{row_end_date.isoformat()}T00:00:00.000Z" if row_end_date else None
+            if contract_rate_id:
+                for entry in existing_pricing_entries:
+                    entry_currency = entry.get("CurrencyCode") or entry.get("currencycode") or product_currency_code
+                    lower_band_value = parse_pricing_band(entry.get("LowerBand") or entry.get("lowerband"))
+                    upper_band_value = parse_pricing_band(entry.get("UpperBand") or entry.get("upperband"))
+                    key = (entry_currency, lower_band_value, upper_band_value)
+                    existing_pricing_index[key] = entry
 
-                legacy_tiers_raw = row.get(tiers_column)
-                structured_tiers = parse_structured_pricing_tiers(row)
+                for row in pricing_driving_rows:
+                    row_effective_date = parse_date(row.get(args.effective_date_column), fallback=parse_date(row.get(args.start_date_column), fallback=start_date_value))
+                    row_end_date = parse_optional_date(row.get(args.end_date_column))
+                    effective_iso = f"{row_effective_date.isoformat()}T00:00:00.000Z"
+                    end_date_iso = f"{row_end_date.isoformat()}T00:00:00.000Z" if row_end_date else None
 
-                if structured_tiers:
-                    canonical_tiers = []
-                    for idx, tier in enumerate(structured_tiers):
-                        lower_value = tier.get("lower")
-                        if lower_value is None:
-                            lower_value = Decimal("0") if idx == 0 else (
-                                canonical_tiers[-1]["upper"] + TIER_INCREMENT
-                                if canonical_tiers[-1]["upper"] is not None
-                                else canonical_tiers[-1]["lower"]
-                            )
-                            lower_value = lower_value.quantize(PRICING_DECIMAL_PLACES)
-                        canonical_tiers.append(
-                            {
-                                "lower": lower_value,
-                                "upper": tier.get("upper"),
-                                "rate": tier["rate"],
-                            }
-                        )
-                else:
-                    legacy_tiers = parse_legacy_pricing_tiers(legacy_tiers_raw)
-                    canonical_tiers = []
-                    if legacy_tiers:
-                        lower_band_value = Decimal("0")
-                        for legacy_tier in legacy_tiers:
-                            upper_value = legacy_tier["upper"]
+                    legacy_tiers_raw = row.get(tiers_column)
+                    structured_tiers = parse_structured_pricing_tiers(row)
+
+                    if structured_tiers:
+                        canonical_tiers = []
+                        for idx, tier in enumerate(structured_tiers):
+                            lower_value = tier.get("lower")
+                            if lower_value is None:
+                                lower_value = Decimal("0") if idx == 0 else (
+                                    canonical_tiers[-1]["upper"] + TIER_INCREMENT
+                                    if canonical_tiers[-1]["upper"] is not None
+                                    else canonical_tiers[-1]["lower"]
+                                )
+                                lower_value = lower_value.quantize(PRICING_DECIMAL_PLACES)
                             canonical_tiers.append(
                                 {
-                                    "lower": lower_band_value,
-                                    "upper": upper_value,
-                                    "rate": legacy_tier["rate"],
+                                    "lower": lower_value,
+                                    "upper": tier.get("upper"),
+                                    "rate": tier["rate"],
                                 }
                             )
-                            if upper_value is None:
-                                break
-                            lower_band_value = (upper_value + TIER_INCREMENT).quantize(PRICING_DECIMAL_PLACES)
-
-                    if not canonical_tiers:
-                        fallback_rate = Decimal(str(parse_rate(row.get(args.rate_column))))
-                        canonical_tiers = [
-                            {
-                                "lower": Decimal("0"),
-                                "upper": None,
-                                "rate": fallback_rate,
-                            }
-                        ]
-
-                tiers_for_creation = list(enumerate(canonical_tiers))
-                tiers_for_creation.sort(key=lambda item: (1 if item[1]["upper"] is None else 0, item[1]["lower"]))
-
-                for index, tier in tiers_for_creation:
-                    lower_value = tier["lower"]
-                    upper_value = tier["upper"]
-                    rate_value = tier["rate"]
-                    lower_band_str = format_decimal(lower_value)
-
-                    if upper_value is None:
-                        upper_band_str = "-1"
                     else:
-                        if upper_value < lower_value:
-                            LOGGER.error(
-                                "Tier %d upper quantity (%s) is below lower quantity (%s) for product '%s'. Skipping remaining tiers.",
-                                index + 1,
-                                upper_value,
-                                lower_value,
+                        legacy_tiers = parse_legacy_pricing_tiers(legacy_tiers_raw)
+                        canonical_tiers = []
+                        if legacy_tiers:
+                            lower_band_value = Decimal("0")
+                            for legacy_tier in legacy_tiers:
+                                upper_value = legacy_tier["upper"]
+                                canonical_tiers.append(
+                                    {
+                                        "lower": lower_band_value,
+                                        "upper": upper_value,
+                                        "rate": legacy_tier["rate"],
+                                    }
+                                )
+                                if upper_value is None:
+                                    break
+                                lower_band_value = (upper_value + TIER_INCREMENT).quantize(PRICING_DECIMAL_PLACES)
+
+                        if not canonical_tiers:
+                            fallback_rate = Decimal(str(parse_rate(row.get(args.rate_column))))
+                            canonical_tiers = [
+                                {
+                                    "lower": Decimal("0"),
+                                    "upper": None,
+                                    "rate": fallback_rate,
+                                }
+                            ]
+
+                    tiers_for_creation = list(enumerate(canonical_tiers))
+                    tiers_for_creation.sort(key=lambda item: (1 if item[1]["upper"] is None else 0, item[1]["lower"]))
+
+                    for index, tier in tiers_for_creation:
+                        lower_value = tier["lower"]
+                        upper_value = tier["upper"]
+                        rate_value = tier["rate"]
+                        lower_band_str = format_decimal(lower_value)
+
+                        if upper_value is None:
+                            upper_band_str = "-1"
+                        else:
+                            if upper_value < lower_value:
+                                LOGGER.error(
+                                    "Tier %d upper quantity (%s) is below lower quantity (%s) for product '%s'. Skipping remaining tiers.",
+                                    index + 1,
+                                    upper_value,
+                                    lower_value,
+                                    product_name,
+                                )
+                                break
+                            upper_band_str = format_decimal(upper_value)
+
+                        existing_key = (product_currency_code, lower_value, upper_value)
+                        existing_entry = existing_pricing_index.get(existing_key)
+                        if existing_entry:
+                            LOGGER.info(
+                                "Pricing tier already exists for product '%s' (currency %s, lower %s, upper %s); skipping creation.",
                                 product_name,
+                                product_currency_code,
+                                lower_band_str,
+                                upper_band_str,
                             )
-                            break
-                        upper_band_str = format_decimal(upper_value)
+                            skipped_existing.append({"existing": existing_entry})
+                            continue
 
-                    existing_key = (product_currency_code, lower_value, upper_value)
-                    existing_entry = existing_pricing_index.get(existing_key)
-                    if existing_entry:
-                        LOGGER.info(
-                            "Pricing tier already exists for product '%s' (currency %s, lower %s, upper %s); skipping creation.",
-                            product_name,
-                            product_currency_code,
-                            lower_band_str,
-                            upper_band_str,
-                        )
-                        skipped_existing.append({"existing": existing_entry})
-                        continue
-
-                    pricing_entry = {
-                        "CurrencyCode": product_currency_code,
-                        "ContractRateId": contract_rate_id,
-                        "EffectiveDate": effective_iso,
-                        "LowerBand": lower_band_str,
-                        "UpperBand": upper_band_str,
-                        "Rate": format_decimal(rate_value),
-                        "RerateFlag": "0",
-                    }
-                    if end_date_iso:
-                        pricing_entry["EndDate"] = end_date_iso
-                    pricing_payload_entries.append(pricing_entry)
+                        pricing_entry = {
+                            "CurrencyCode": product_currency_code,
+                            "ContractRateId": contract_rate_id,
+                            "EffectiveDate": effective_iso,
+                            "LowerBand": lower_band_str,
+                            "UpperBand": upper_band_str,
+                            "Rate": format_decimal(rate_value),
+                            "RerateFlag": "0",
+                        }
+                        if end_date_iso:
+                            pricing_entry["EndDate"] = end_date_iso
+                        pricing_payload_entries.append(pricing_entry)
 
             pricing_responses: List[Dict] = []
             if pricing_payload_entries:
@@ -1453,7 +1515,7 @@ def main() -> None:
                 tier_descriptions.append(
                     f"    Tier {idx + 1}: from {lower_text} to {upper_text} at rate {format_decimal(tier['rate'])}"
                 )
-            tiers_summary = "\n".join(tier_descriptions) if tier_descriptions else "    (no tiers defined)"
+            tiers_summary = "\n".join(tier_descriptions) if tier_descriptions else "    (no tiers defined or bundle component only)"
 
             product_summary = (
                 f"Product '{product_name}' (currency {product_currency_code}):\n"
