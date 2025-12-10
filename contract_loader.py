@@ -203,6 +203,16 @@ def parse_date(value: Optional[str], fallback: Optional[date] = None) -> date:
     return fallback or date.today()
 
 
+def parse_optional_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        LOGGER.warning("Invalid date '%s', defaulting to None", value)
+        return None
+
+
 def parse_quantity(value: Optional[str]) -> int:
     if not value:
         return 1
@@ -629,19 +639,34 @@ def create_pricing(
     lower_band: str,
     upper_band: str,
     rate: str,
+    end_date_iso: Optional[str] = None,
     rerate_flag: str = "0",
 ) -> Dict:
-    payload = {
-        "brmObjects": {
-            "CurrencyCode": currency_code,
-            "ContractRateId": contract_rate_id,
-            "EffectiveDate": effective_date_iso,
-            "LowerBand": lower_band,
-            "Rate": rate,
-            "RerateFlag": rerate_flag,
-            "UpperBand": upper_band,
-        }
+    brm_objects = {
+        "CurrencyCode": currency_code,
+        "ContractRateId": contract_rate_id,
+        "EffectiveDate": effective_date_iso,
+        "LowerBand": lower_band,
+        "Rate": rate,
+        "RerateFlag": rerate_flag,
+        "UpperBand": upper_band,
+        "EndDate": end_date_iso
     }
+    # if end_date_iso:
+    #     brm_objects["EndDate"] = end_date_iso
+
+    payload = {"brmObjects": brm_objects}
+    base_url = api_base.rstrip("/") + "/"
+    url = urljoin(base_url, "PRICING")
+    return http_post_json(url, payload, headers={"sessionId": session_id})
+
+
+def create_pricing_batch(
+    api_base: str,
+    session_id: str,
+    pricing_entries: List[Dict[str, str]],
+) -> Dict:
+    payload = {"brmObjects": pricing_entries}
     base_url = api_base.rstrip("/") + "/"
     url = urljoin(base_url, "PRICING")
     return http_post_json(url, payload, headers={"sessionId": session_id})
@@ -701,6 +726,7 @@ def main() -> None:
     parser.add_argument("--rate-column", default="rate", help="Column containing the contract rate.")
     parser.add_argument("--start-date-column", default="start_date", help="Column containing start date (YYYY-MM-DD). Optional.")
     parser.add_argument("--effective-date-column", default="effective_date", help="Column containing rate effective date (YYYY-MM-DD). Optional.")
+    parser.add_argument("--end-date-column", default="end_date", help="Column containing rate end date (YYYY-MM-DD). Optional.")
     parser.add_argument("--contract-status-column", default="contract_status", help="Column for contract status (default Terminated).")
     parser.add_argument("--account-product-status-column", default="account_product_status", help="Column for account product status (default Active).")
     parser.add_argument("--env-file", default=".env", help="Path to the environment file with credentials and endpoints.")
@@ -726,6 +752,11 @@ def main() -> None:
         "--rate-only-column",
         default="contract_rate_only",
         help="Column that flags rows to skip account product creation and only create contract rate/pricing (values like 'true', 'yes', '1').",
+    )
+    parser.add_argument(
+        "--pricing-only-column",
+        default="pricing_only",
+        help="Column that flags rows to only create pricing records (no account product or contract rate creation).",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     args = parser.parse_args()
@@ -1127,56 +1158,117 @@ def main() -> None:
         product_summaries: List[str] = []
         processed_currencies: Set[str] = set(created_contract_currencies.keys())
 
+        pricing_only_column = args.pricing_only_column
+        product_groups: Dict[Tuple[str, str], List[Dict[str, str]]] = {}
         for row in grouped_rows:
             product_name = row.get(args.product_column)
+            row_currency_code = row.get(args.currency_column) or currency_code
             if not product_name:
                 LOGGER.warning("Skipping row in contract '%s' with missing product name: %s", contract_key, row)
                 continue
+            key = (product_name, row_currency_code)
+            product_groups.setdefault(key, []).append(row)
 
+        for (product_name, product_currency_code), product_rows in product_groups.items():
             product_id = get_product_id(product_name)
             if not product_id:
                 continue
 
-            row_currency_code = row.get(args.currency_column) or currency_code
-            if row_currency_code not in processed_currencies:
-                LOGGER.info(
-                    "Creating additional contract currency %s for contract %s",
-                    row_currency_code,
-                    contract_id,
-                )
+            if product_currency_code not in processed_currencies:
+                LOGGER.info("Creating additional contract currency %s for contract %s", product_currency_code, contract_id)
                 try:
-                    currency_response = create_contract_currency(
-                        api_base,
-                        session_id,
-                        contract_id,
-                        row_currency_code,
-                    )
-                    created_contract_currencies[row_currency_code] = currency_response
-                    processed_currencies.add(row_currency_code)
+                    currency_response = create_contract_currency(api_base, session_id, contract_id, product_currency_code)
+                    created_contract_currencies[product_currency_code] = currency_response
+                    processed_currencies.add(product_currency_code)
                 except Exception as exc:
                     LOGGER.error(
                         "Contract currency creation failed for contract '%s' currency '%s': %s",
                         contract_key,
-                        row_currency_code,
+                        product_currency_code,
                         exc,
                     )
                     continue
 
-            row_start_date = parse_date(row.get(args.start_date_column), fallback=start_date_value)
-            row_effective_date = parse_date(row.get(args.effective_date_column), fallback=row_start_date)
-            account_product_status = row.get(args.account_product_status_column) or "Active"
-            quantity_value = parse_quantity(row.get(args.quantity_column))
-            rate_only_mode = parse_bool(row.get(rate_only_column))
+            non_pricing_only_rows = [r for r in product_rows if not parse_bool(r.get(pricing_only_column))]
+            contract_rate_response: Optional[Dict] = None
+            contract_rate_id: Optional[str] = None
 
-            account_product_response: Optional[Dict] = None
-            if rate_only_mode:
-                LOGGER.info(
-                    "Skipping account product creation for '%s' in contract %s (rate-only row)",
-                    product_name,
-                    contract_id,
-                )
-                account_product_response = {"skipped": True, "reason": "rate_only_mode", "product": product_name}
+            if non_pricing_only_rows:
+                LOGGER.info("Creating contract rate for contract %s, product %s", contract_id, product_id)
+                try:
+                    contract_rate_response = create_contract_rate(api_base, session_id, contract_id, product_id)
+                except ApiTimeout as timeout_exc:
+                    LOGGER.warning(
+                        "Contract rate creation for '%s' timed out; verifying record: %s",
+                        product_name,
+                        timeout_exc,
+                    )
+                    records = find_contract_rate(api_base, session_id, contract_id, product_id)
+                    if not records:
+                        LOGGER.error(
+                            "Contract rate not found after timeout for product '%s' in contract '%s'",
+                            product_name,
+                            contract_key,
+                        )
+                    else:
+                        contract_rate_response = {"queryResponse": records}
+                        contract_rate_id = records[0].get("Id") or records[0].get("id")
+                except Exception as exc:
+                    LOGGER.error(
+                        "Contract rate creation failed for product '%s' in contract '%s': %s",
+                        product_name,
+                        contract_key,
+                        exc,
+                    )
+                else:
+                    rate_create_resp = contract_rate_response.get("createResponse") or []
+                    if rate_create_resp:
+                        contract_rate_id = rate_create_resp[0].get("Id")
+                    if not contract_rate_id:
+                        LOGGER.error(
+                            "Contract rate creation returned no Id for product '%s' in contract '%s': %s",
+                            product_name,
+                            contract_key,
+                            contract_rate_response,
+                        )
             else:
+                existing_rates = find_contract_rate(api_base, session_id, contract_id, product_id)
+                contract_rate_response = {"queryResponse": existing_rates}
+                contract_rate_id = existing_rates[0].get("Id") or existing_rates[0].get("id") if existing_rates else None
+                if not contract_rate_id:
+                    LOGGER.error(
+                        "Pricing-only rows for product '%s' but no contract rate exists (contract '%s'). Skipping pricing creation.",
+                        product_name,
+                        contract_key,
+                    )
+                    continue
+
+            if not contract_rate_id:
+                LOGGER.error(
+                    "No contract rate Id resolved for product '%s' in contract '%s'; skipping product.",
+                    product_name,
+                    contract_key,
+                )
+                continue
+
+            # Account products for non-pricing-only rows (rate-only still skips).
+            account_product_responses: List[Dict] = []
+            for row in non_pricing_only_rows:
+                row_start_date = parse_date(row.get(args.start_date_column), fallback=start_date_value)
+                account_product_status = row.get(args.account_product_status_column) or "Active"
+                quantity_value = parse_quantity(row.get(args.quantity_column))
+                rate_only_mode = parse_bool(row.get(rate_only_column))
+                if rate_only_mode:
+                    LOGGER.info(
+                        "Skipping account product creation for '%s' in contract %s (rate-only row)",
+                        product_name,
+                        contract_id,
+                    )
+                    account_product_responses.append(
+                        {"skipped": True, "reason": "rate_only_mode", "product": product_name, "row": row}
+                    )
+                    continue
+
                 LOGGER.info(
                     "Creating account product '%s' for contract %s (account %s)",
                     product_name,
@@ -1184,7 +1276,7 @@ def main() -> None:
                     account_id,
                 )
                 try:
-                    account_product_response = create_account_product(
+                    response = create_account_product(
                         api_base,
                         session_id,
                         account_id,
@@ -1194,6 +1286,7 @@ def main() -> None:
                         quantity_value,
                         account_product_status,
                     )
+                    account_product_responses.append(response)
                 except ApiTimeout as timeout_exc:
                     LOGGER.warning(
                         "Account product creation for '%s' timed out; verifying record: %s",
@@ -1201,14 +1294,14 @@ def main() -> None:
                         timeout_exc,
                     )
                     records = find_account_product(api_base, session_id, contract_id, product_id)
-                    if not records:
+                    if records:
+                        account_product_responses.append({"queryResponse": records})
+                    else:
                         LOGGER.error(
                             "Account product '%s' not found after timeout for contract '%s'",
                             product_name,
                             contract_key,
                         )
-                        continue
-                    account_product_response = {"queryResponse": records}
                 except Exception as exc:
                     LOGGER.error(
                         "Account product creation failed for '%s' in contract '%s': %s",
@@ -1216,178 +1309,142 @@ def main() -> None:
                         contract_key,
                         exc,
                     )
-                    continue
-
-            LOGGER.info("Creating contract rate for contract %s, product %s", contract_id, product_id)
-            try:
-                contract_rate_response = create_contract_rate(
-                    api_base,
-                    session_id,
-                    contract_id,
-                    product_id,
-                )
-            except ApiTimeout as timeout_exc:
-                LOGGER.warning(
-                    "Contract rate creation for '%s' timed out; verifying record: %s",
-                    product_name,
-                    timeout_exc,
-                )
-                records = find_contract_rate(api_base, session_id, contract_id, product_id)
-                if not records:
-                    LOGGER.error(
-                        "Contract rate not found after timeout for product '%s' in contract '%s'",
-                        product_name,
-                        contract_key,
-                    )
-                    continue
-                contract_rate_response = {"queryResponse": records}
-                rate_create_resp = records
-                contract_rate_id = records[0].get("Id") or records[0].get("id")
-            except Exception as exc:
-                LOGGER.error(
-                    "Contract rate creation failed for product '%s' in contract '%s': %s",
-                    product_name,
-                    contract_key,
-                    exc,
-                )
-                continue
-            else:
-                rate_create_resp = contract_rate_response.get("createResponse") or []
-                contract_rate_id = None
-                if rate_create_resp:
-                    contract_rate_id = rate_create_resp[0].get("Id")
-                if not contract_rate_id:
-                    LOGGER.error(
-                        "Contract rate creation returned no Id for product '%s' in contract '%s': %s",
-                        product_name,
-                        contract_key,
-                        contract_rate_response,
-                    )
-                    continue
 
             existing_pricing_entries = find_pricing_entries(api_base, session_id, contract_rate_id)
             existing_pricing_index: Dict[Tuple[str, Optional[Decimal], Optional[Decimal]], Dict] = {}
             for entry in existing_pricing_entries:
-                entry_currency = entry.get("CurrencyCode") or entry.get("currencycode") or row_currency_code
+                entry_currency = entry.get("CurrencyCode") or entry.get("currencycode") or product_currency_code
                 lower_band_value = parse_pricing_band(entry.get("LowerBand") or entry.get("lowerband"))
                 upper_band_value = parse_pricing_band(entry.get("UpperBand") or entry.get("upperband"))
                 key = (entry_currency, lower_band_value, upper_band_value)
                 existing_pricing_index[key] = entry
 
-            legacy_tiers_raw = row.get(tiers_column)
-            structured_tiers = parse_structured_pricing_tiers(row)
+            pricing_payload_entries: List[Dict[str, str]] = []
+            skipped_existing: List[Dict[str, Any]] = []
 
-            if structured_tiers:
-                canonical_tiers = []
-                for idx, tier in enumerate(structured_tiers):
-                    lower_value = tier.get("lower")
-                    if lower_value is None:
-                        lower_value = Decimal("0") if idx == 0 else (canonical_tiers[-1]["upper"] + TIER_INCREMENT if canonical_tiers[-1]["upper"] is not None else canonical_tiers[-1]["lower"])
-                        lower_value = lower_value.quantize(PRICING_DECIMAL_PLACES)
-                    canonical_tiers.append(
-                        {
-                            "lower": lower_value,
-                            "upper": tier.get("upper"),
-                            "rate": tier["rate"],
-                        }
-                    )
-            else:
-                legacy_tiers = parse_legacy_pricing_tiers(legacy_tiers_raw)
-                canonical_tiers = []
-                if legacy_tiers:
-                    lower_band_value = Decimal("0")
-                    for legacy_tier in legacy_tiers:
-                        upper_value = legacy_tier["upper"]
+            for row in product_rows:
+                row_effective_date = parse_date(row.get(args.effective_date_column), fallback=parse_date(row.get(args.start_date_column), fallback=start_date_value))
+                row_end_date = parse_optional_date(row.get(args.end_date_column))
+                effective_iso = f"{row_effective_date.isoformat()}T00:00:00.000Z"
+                end_date_iso = f"{row_end_date.isoformat()}T00:00:00.000Z" if row_end_date else None
+
+                legacy_tiers_raw = row.get(tiers_column)
+                structured_tiers = parse_structured_pricing_tiers(row)
+
+                if structured_tiers:
+                    canonical_tiers = []
+                    for idx, tier in enumerate(structured_tiers):
+                        lower_value = tier.get("lower")
+                        if lower_value is None:
+                            lower_value = Decimal("0") if idx == 0 else (
+                                canonical_tiers[-1]["upper"] + TIER_INCREMENT
+                                if canonical_tiers[-1]["upper"] is not None
+                                else canonical_tiers[-1]["lower"]
+                            )
+                            lower_value = lower_value.quantize(PRICING_DECIMAL_PLACES)
                         canonical_tiers.append(
                             {
-                                "lower": lower_band_value,
-                                "upper": upper_value,
-                                "rate": legacy_tier["rate"],
+                                "lower": lower_value,
+                                "upper": tier.get("upper"),
+                                "rate": tier["rate"],
                             }
                         )
-                        if upper_value is None:
-                            break
-                        lower_band_value = (upper_value + TIER_INCREMENT).quantize(PRICING_DECIMAL_PLACES)
+                else:
+                    legacy_tiers = parse_legacy_pricing_tiers(legacy_tiers_raw)
+                    canonical_tiers = []
+                    if legacy_tiers:
+                        lower_band_value = Decimal("0")
+                        for legacy_tier in legacy_tiers:
+                            upper_value = legacy_tier["upper"]
+                            canonical_tiers.append(
+                                {
+                                    "lower": lower_band_value,
+                                    "upper": upper_value,
+                                    "rate": legacy_tier["rate"],
+                                }
+                            )
+                            if upper_value is None:
+                                break
+                            lower_band_value = (upper_value + TIER_INCREMENT).quantize(PRICING_DECIMAL_PLACES)
 
-                if not canonical_tiers:
-                    fallback_rate = Decimal(str(parse_rate(row.get(args.rate_column))))
-                    canonical_tiers = [
-                        {
-                            "lower": Decimal("0"),
-                            "upper": None,
-                            "rate": fallback_rate,
-                        }
-                    ]
+                    if not canonical_tiers:
+                        fallback_rate = Decimal(str(parse_rate(row.get(args.rate_column))))
+                        canonical_tiers = [
+                            {
+                                "lower": Decimal("0"),
+                                "upper": None,
+                                "rate": fallback_rate,
+                            }
+                        ]
+
+                tiers_for_creation = list(enumerate(canonical_tiers))
+                tiers_for_creation.sort(key=lambda item: (1 if item[1]["upper"] is None else 0, item[1]["lower"]))
+
+                for index, tier in tiers_for_creation:
+                    lower_value = tier["lower"]
+                    upper_value = tier["upper"]
+                    rate_value = tier["rate"]
+                    lower_band_str = format_decimal(lower_value)
+
+                    if upper_value is None:
+                        upper_band_str = "-1"
+                    else:
+                        if upper_value < lower_value:
+                            LOGGER.error(
+                                "Tier %d upper quantity (%s) is below lower quantity (%s) for product '%s'. Skipping remaining tiers.",
+                                index + 1,
+                                upper_value,
+                                lower_value,
+                                product_name,
+                            )
+                            break
+                        upper_band_str = format_decimal(upper_value)
+
+                    existing_key = (product_currency_code, lower_value, upper_value)
+                    existing_entry = existing_pricing_index.get(existing_key)
+                    if existing_entry:
+                        LOGGER.info(
+                            "Pricing tier already exists for product '%s' (currency %s, lower %s, upper %s); skipping creation.",
+                            product_name,
+                            product_currency_code,
+                            lower_band_str,
+                            upper_band_str,
+                        )
+                        skipped_existing.append({"existing": existing_entry})
+                        continue
+
+                    pricing_entry = {
+                        "CurrencyCode": product_currency_code,
+                        "ContractRateId": contract_rate_id,
+                        "EffectiveDate": effective_iso,
+                        "LowerBand": lower_band_str,
+                        "UpperBand": upper_band_str,
+                        "Rate": format_decimal(rate_value),
+                        "RerateFlag": "0",
+                    }
+                    if end_date_iso:
+                        pricing_entry["EndDate"] = end_date_iso
+                    pricing_payload_entries.append(pricing_entry)
 
             pricing_responses: List[Dict] = []
-            tiers_for_creation = list(enumerate(canonical_tiers))
-            tiers_for_creation.sort(
-                key=lambda item: (0 if item[1]["upper"] is None else 1, item[1]["lower"])
-            )
-
-            for index, tier in tiers_for_creation:
-                lower_value = tier["lower"]
-                upper_value = tier["upper"]
-                rate_value = tier["rate"]
-                lower_band_str = format_decimal(lower_value)
-
-                if upper_value is None:
-                    upper_band_str = "-1"
-                else:
-                    if upper_value < lower_value:
-                        LOGGER.error(
-                            "Tier %d upper quantity (%s) is below lower quantity (%s) for product '%s'. Skipping remaining tiers.",
-                            index + 1,
-                            upper_value,
-                            lower_value,
-                            product_name,
-                        )
-                        break
-                    upper_band_str = format_decimal(upper_value)
-
-                existing_key = (row_currency_code, lower_value, upper_value)
-                existing_entry = existing_pricing_index.get(existing_key)
-                if existing_entry:
-                    LOGGER.info(
-                        "Pricing tier already exists for product '%s' (currency %s, lower %s, upper %s); skipping creation.",
-                        product_name,
-                        row_currency_code,
-                        lower_band_str,
-                        upper_band_str,
-                    )
-                    pricing_responses.append({"existing": existing_entry})
-                    continue
-
-                effective_iso = f"{row_effective_date.isoformat()}T00:00:00.000Z"
+            if pricing_payload_entries:
+                LOGGER.info(
+                    "Creating %d pricing records for product '%s' in a single batch (contract %s)",
+                    len(pricing_payload_entries),
+                    product_name,
+                    contract_id,
+                )
                 try:
-                    pricing_response = create_pricing(
-                        api_base,
-                        session_id,
-                        contract_rate_id,
-                        row_currency_code,
-                        effective_iso,
-                        lower_band_str,
-                        upper_band_str,
-                        format_decimal(rate_value),
+                    pricing_responses.append(
+                        create_pricing_batch(api_base, session_id, pricing_payload_entries)
                     )
-                    pricing_responses.append(pricing_response)
                 except Exception as exc:
                     LOGGER.error(
-                        "Pricing creation failed for product '%s' tier %d in contract '%s': %s",
+                        "Batch pricing creation failed for product '%s' in contract '%s': %s",
                         product_name,
-                        index + 1,
                         contract_key,
                         exc,
                     )
-                    break
-
-                if upper_value is None and index < len(canonical_tiers) - 1:
-                    LOGGER.debug(
-                        "Unlimited tier (index %d) created before additional tiers for product '%s'.",
-                        index + 1,
-                        product_name,
-                    )
-
 
             tier_descriptions = []
             for idx, tier in enumerate(canonical_tiers):
@@ -1399,12 +1456,12 @@ def main() -> None:
             tiers_summary = "\n".join(tier_descriptions) if tier_descriptions else "    (no tiers defined)"
 
             product_summary = (
-                f"Product '{product_name}':\n"
-                f"  Mode: {'Rate-only (skipped account product)' if rate_only_mode else 'Account product + pricing'}\n"
-                f"  Tier configuration:\n{tiers_summary}\n"
-                f"  Account product response: {json.dumps(account_product_response, indent=2)}\n"
+                f"Product '{product_name}' (currency {product_currency_code}):\n"
+                f"  Contract rate Id: {contract_rate_id}\n"
+                f"  Tier configuration (last processed row):\n{tiers_summary}\n"
+                f"  Account product responses: {json.dumps(account_product_responses, indent=2)}\n"
                 f"  Contract rate response: {json.dumps(contract_rate_response, indent=2)}\n"
-                f"  Pricing responses: {json.dumps(pricing_responses, indent=2)}"
+                f"  Pricing responses: {json.dumps(pricing_responses or skipped_existing, indent=2)}"
             )
             product_summaries.append(product_summary)
 
