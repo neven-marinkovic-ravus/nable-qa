@@ -194,6 +194,46 @@ def perform_lookup(api_base: str, session_id: str, sql: str, timeout: int = 30) 
         raise
 
 
+_PRODUCT_CACHE: Dict[str, Optional[str]] = {}
+_PRODUCT_LOOKUP_API_BASE: Optional[str] = None
+_PRODUCT_LOOKUP_SESSION_ID: Optional[str] = None
+
+
+def configure_product_lookup(api_base: str, session_id: str) -> None:
+    global _PRODUCT_LOOKUP_API_BASE, _PRODUCT_LOOKUP_SESSION_ID
+    _PRODUCT_LOOKUP_API_BASE = api_base
+    _PRODUCT_LOOKUP_SESSION_ID = session_id
+    _PRODUCT_CACHE.clear()
+
+
+def get_product_id(product_name: str) -> Optional[str]:
+    if product_name in _PRODUCT_CACHE:
+        return _PRODUCT_CACHE[product_name]
+    if not _PRODUCT_LOOKUP_API_BASE or not _PRODUCT_LOOKUP_SESSION_ID:
+        LOGGER.error("Product lookup attempted before login context was configured.")
+        return None
+
+    LOGGER.info("Looking up product '%s'", product_name)
+    try:
+        lookup_response = perform_lookup(
+            _PRODUCT_LOOKUP_API_BASE,
+            _PRODUCT_LOOKUP_SESSION_ID,
+            build_product_query(product_name),
+        )
+    except Exception as exc:
+        LOGGER.error("Product lookup failed for '%s': %s", product_name, exc)
+        _PRODUCT_CACHE[product_name] = None
+        return None
+
+    records = lookup_response.get("queryResponse") or []
+    first_record = records[0] if records else {}
+    product_id_value = first_record.get("Id") or first_record.get("id")
+    if not product_id_value:
+        LOGGER.warning("No product found for '%s'", product_name)
+    _PRODUCT_CACHE[product_name] = product_id_value
+    return product_id_value
+
+
 def parse_date(value: Optional[str], fallback: Optional[date] = None) -> date:
     if value:
         try:
@@ -549,7 +589,15 @@ def update_account_billing_profile(
     raise RuntimeError("Unable to update account billing profile: no valid endpoint responded.")
 
 
-def create_contract(api_base: str, session_id: str, account_id: str, contract_number: str, start_date_value: date, status: str) -> Dict:
+def create_contract(
+    api_base: str,
+    session_id: str,
+    account_id: str,
+    contract_number: str,
+    start_date_value: date,
+    status: str,
+    cpq_contract_id: str,
+) -> Dict:
     payload = {
         "brmObjects": {
             "AccountId": account_id,
@@ -557,6 +605,7 @@ def create_contract(api_base: str, session_id: str, account_id: str, contract_nu
             "StartDate": start_date_value.isoformat(),
             "OnEndDate": "Terminate",
             "ContractStatus": status,
+            "C_CPQContractId": cpq_contract_id,
         }
     }
     base_url = api_base.rstrip("/") + "/"
@@ -708,6 +757,41 @@ def find_pricing_entries(api_base: str, session_id: str, contract_rate_id: str) 
     return response.get("queryResponse", []) or []
 
 
+def lookup_contract_id_by_cpq_id(api_base: str, session_id: str, cpq_contract_id: str, account_id: str) -> Optional[str]:
+    if not cpq_contract_id:
+        return None
+    escaped_cpq_id = sanitize_value(cpq_contract_id)
+    sql = (
+        "SELECT Id FROM CONTRACT "
+        f"WHERE C_CPQContractId = '{escaped_cpq_id}' "
+        f"AND AccountId = '{account_id}'"
+    )
+    response = perform_lookup(api_base, session_id, sql)
+    records = response.get("queryResponse", []) or []
+    if records:
+        return records[0].get("Id")
+    return None
+
+
+def get_account_product(api_base: str, session_id: str, account_product_id: str) -> List[Dict]:
+    sql = (
+        "SELECT Id, Status "
+        f"FROM ACCOUNT_PRODUCT WHERE Id = '{account_product_id}'"
+    )
+    response = perform_lookup(api_base, session_id, sql)
+    return response.get("queryResponse", []) or []
+
+
+def update_account_product(api_base: str, session_id: str, payload: Dict) -> Dict:
+    wrapped_payload = payload if "brmObjects" in payload else {"brmObjects": payload}
+    base_payload = wrapped_payload.get("brmObjects") or {}
+    ap_id = base_payload.get("Id") or base_payload.get("id")
+    base_url = api_base.rstrip("/") + "/"
+    url_path = f"ACCOUNT_PRODUCT/{ap_id}" if ap_id else "ACCOUNT_PRODUCT"
+    url = urljoin(base_url, url_path)
+    return http_put_json(url, wrapped_payload, headers={"sessionId": session_id})
+
+
 def extract_first_value(response: Dict, field: str) -> Optional[str]:
     records = response.get("queryResponse")
     if not records:
@@ -763,6 +847,16 @@ def main() -> None:
         default="bundle_component",
         help="Column that flags rows whose account products should be created without contract rate or pricing.",
     )
+    parser.add_argument(
+        "--cpq-contract-id-column",
+        default="CPQ_Contractid",
+        help="Column containing CPQ contract id used for downstream amendments.",
+    )
+    parser.add_argument(
+        "--action-column",
+        default="action",
+        help="Column determining row behavior: Create, Quantity Change, Price Change (future).",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     args = parser.parse_args()
 
@@ -785,35 +879,33 @@ def main() -> None:
 
     session_id = login(login_url, username, password)
     LOGGER.info("Login succeeded. SessionID obtained.")
+    configure_product_lookup(api_base, session_id)
 
     csv_path = Path(args.input).expanduser().resolve()
     if not csv_path.exists():
         raise SystemExit(f"Input CSV not found: {csv_path}")
 
-    product_cache: Dict[str, Optional[str]] = {}
-
-    def get_product_id(product_name: str) -> Optional[str]:
-        if product_name in product_cache:
-            return product_cache[product_name]
-
-        LOGGER.info("Looking up product '%s'", product_name)
-        try:
-            lookup_response = perform_lookup(api_base, session_id, build_product_query(product_name))
-        except Exception as exc:
-            LOGGER.error("Product lookup failed for '%s': %s", product_name, exc)
-            product_cache[product_name] = None
-            return None
-
-        product_id_value = extract_first_value(lookup_response, "Id")
-        if not product_id_value:
-            LOGGER.warning("No product found for '%s'", product_name)
-        product_cache[product_name] = product_id_value
-        return product_id_value
-
     rows = list(load_rows(csv_path))
     if not rows:
         LOGGER.info("Input CSV %s contained no data rows.", csv_path)
         return
+
+    actions = {(row.get(args.action_column) or "").strip().lower() for row in rows}
+    create_actions = {"", "create"}
+    amend_actions = {"quantity change", "price change"}
+
+    if (actions & create_actions) and (actions & amend_actions):
+        raise SystemExit(
+            "Mixed 'Create' and 'Quantity Change'/'Price Change' rows in same file. "
+            "Separate these into different CSVs. Failing fast."
+        )
+
+    is_amendment_file = all(
+        (row.get(args.action_column) or "").strip().lower() in {"quantity change", "price change"}
+        for row in rows
+    )
+    if is_amendment_file:
+        return process_amendments(rows, args, api_base, session_id)
 
     contract_column = args.contract_group_column
     tiers_column = args.tiers_column
@@ -891,6 +983,7 @@ def main() -> None:
 
         contract_status = first_row.get(args.contract_status_column) or "Terminated"
         start_date_value = parse_date(first_row.get(args.start_date_column))
+        cpq_contract_id = (first_row.get(args.cpq_contract_id_column) or "").strip()
         bill_to_value = (
             first_row.get("bill_to")
             or first_row.get("bill_to_name")
@@ -1076,6 +1169,7 @@ def main() -> None:
                 contract_number,
                 start_date_value,
                 contract_status,
+                cpq_contract_id,
             )
         except Exception as exc:
             LOGGER.error(
@@ -1538,6 +1632,104 @@ def main() -> None:
             )
         summary_lines.extend(product_summaries)
         print("\n".join(summary_lines))
+
+
+def process_amendments(rows: List[Dict[str, str]], args, api_base: str, session_id: str) -> None:
+    """
+    Process amendment-mode rows. Supports Quantity Change now, Price Change later.
+    Rows execute independently; no grouping by contract.
+    """
+    for idx, row in enumerate(rows, start=1):
+        action = (row.get(args.action_column) or "").strip().lower()
+
+        if action == "quantity change":
+            handle_quantity_change(row, args, api_base, session_id, idx)
+        elif action == "price change":
+            LOGGER.error("Price Change not implemented yet. Row %s skipped.", idx)
+        else:
+            LOGGER.error("Invalid action '%s' in amendment-mode. Row %s skipped.", action, idx)
+
+
+def handle_quantity_change(row, args, api_base, session_id, row_number):
+    account_name = row.get(args.account_column, "").strip()
+    product_name = row.get(args.product_column, "").strip()
+    cpq_contract_id = row.get(args.cpq_contract_id_column, "").strip()
+    quantity_str = row.get(args.quantity_column, "").strip()
+
+    try:
+        new_quantity = Decimal(quantity_str)
+    except Exception:
+        LOGGER.error("Row %s: invalid quantity '%s'. Skipping row.", row_number, quantity_str)
+        return
+
+    try:
+        account_lookup = perform_lookup(api_base, session_id, build_account_query(account_name))
+    except Exception as exc:
+        LOGGER.error("Row %s: account lookup failed for '%s': %s", row_number, account_name, exc)
+        return
+    account_records = account_lookup.get("queryResponse", [])
+    if not account_records:
+        LOGGER.error("Row %s: account '%s' not found. Skipping row.", row_number, account_name)
+        return
+    account_id = account_records[0].get("Id")
+
+    if not cpq_contract_id:
+        LOGGER.error("Row %s: missing CPQ contract id. Skipping row.", row_number)
+        return
+
+    contract_id = lookup_contract_id_by_cpq_id(api_base, session_id, cpq_contract_id, account_id)
+    if not contract_id:
+        LOGGER.error("Row %s: contract with CPQ id '%s' not found. Skipping row.", row_number, cpq_contract_id)
+        return
+
+    product_id = get_product_id(product_name)
+    if not product_id:
+        LOGGER.error("Row %s: product '%s' not found. Skipping row.", row_number, product_name)
+        return
+
+    ap_records = find_account_product(api_base, session_id, contract_id, product_id)
+    if not ap_records:
+        LOGGER.warning(
+            "Row %s: no account product found for contract CPQ id '%s' product '%s'. Skipping.",
+            row_number,
+            cpq_contract_id,
+            product_name,
+        )
+        return
+    ap_id = ap_records[0]["Id"]
+
+    ap_details = get_account_product(api_base, session_id, ap_id)
+    if not ap_details:
+        LOGGER.warning("Row %s: account product '%s' not found. Skipping.", row_number, ap_id)
+        return
+    ap_detail = ap_details[0]
+    status = ap_detail.get("Status") or ap_detail.get("status")
+    if str(status).upper() != "ACTIVE":
+        LOGGER.warning(
+            "Row %s: AP '%s' not ACTIVE (Status=%s). Skipping.",
+            row_number,
+            ap_id,
+            status,
+        )
+        return
+
+    payload = {"Id": ap_id, "Quantity": str(new_quantity)}
+    base_url = api_base.rstrip("/") + "/"
+    update_url = urljoin(base_url, f"ACCOUNT_PRODUCT/{ap_id}")
+    LOGGER.info(
+        "Row %s: sending quantity update call to %s with payload %s",
+        row_number,
+        update_url,
+        {"brmObjects": payload},
+    )
+    try:
+        update_response = update_account_product(api_base, session_id, payload)
+    except Exception as exc:
+        LOGGER.error("Row %s: quantity update failed for AP %s: %s", row_number, ap_id, exc)
+        return
+    LOGGER.info("Row %s: update response for AP %s: %s", row_number, ap_id, update_response)
+
+    LOGGER.info("Row %s: Updated quantity for AccountProduct %s to %s", row_number, ap_id, new_quantity)
 
 
 if __name__ == "__main__":

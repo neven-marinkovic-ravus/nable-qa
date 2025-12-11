@@ -1,0 +1,2 @@
+action,contract,CPQ_Contractid,account_name,product_name,bundle_component,currency_code,quantity,start_date,contract_status,account_product_status,rate,effective_date,end_date,tier1_from_qty,tier1_to_qty,tier1_rate,tier2_from_qty,tier2_to_qty,tier2_rate,contract_rate_only,pricing_only
+Quantity Change,Contract-A,1,Neven 40,UEM N-Sight Basic Bundle,,USD,950,2026-01-01,Terminated,Active,1.85,2026-01-01,2026-01-31,0,900.0000000000,1.80,900.0000000001,-1,0,,
