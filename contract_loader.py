@@ -138,6 +138,24 @@ def http_get_json(url: str, headers: Optional[Dict[str, str]] = None, timeout: i
         raise RuntimeError(f"GET {url} failed: {err}") from err
 
 
+def http_delete_json(url: str, payload: Dict, headers: Optional[Dict[str, str]] = None, timeout: int = 30) -> Dict:
+    body = json.dumps(payload).encode("utf-8")
+    request = Request(url, data=body, method="DELETE")
+    request.add_header("Content-Type", "application/json")
+    if headers:
+        for name, value in headers.items():
+            request.add_header(name, value)
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            return json.loads(response.read().decode(charset))
+    except HTTPError as err:
+        details = err.read().decode("utf-8", "replace")
+        raise RuntimeError(f"DELETE {url} failed ({err.code}): {details}") from err
+    except URLError as err:
+        raise RuntimeError(f"DELETE {url} failed: {err}") from err
+
+
 def login(login_url: str, username: str, password: str) -> str:
     LOGGER.info("Authenticating with BillingPlatform")
     payload = {"username": username, "password": password}
@@ -983,9 +1001,9 @@ def update_pricing_record(api_base: str, session_id: str, payload: Dict) -> Dict
 
 def delete_pricing_batch(api_base: str, session_id: str, ids: List[str]) -> Dict:
     base_url = api_base.rstrip("/") + "/"
-    url = urljoin(base_url, "PRICING/deleteBatch")
-    payload = [{"Id": pid} for pid in ids]
-    return http_post_json(url, payload, headers={"sessionId": session_id})
+    url = urljoin(base_url, "delete/PRICING")
+    payload = {"brmObjects": [{"Id": pid} for pid in ids]}
+    return http_delete_json(url, payload, headers={"sessionId": session_id})
 
 
 def lookup_contract_id_by_cpq_id(api_base: str, session_id: str, cpq_contract_id: str, account_id: str) -> Optional[str]:
