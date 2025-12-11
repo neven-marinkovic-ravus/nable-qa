@@ -5,7 +5,8 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, date
+from collections import defaultdict
+from datetime import datetime, date, timedelta
 from decimal import Decimal, getcontext
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -253,6 +254,19 @@ def parse_optional_date(value: Optional[str]) -> Optional[date]:
         return None
 
 
+def parse_iso_to_date(value: Optional[str]) -> Optional[date]:
+    if not value:
+        return None
+    text = value.split("T", 1)[0].strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        LOGGER.warning("Invalid date '%s', defaulting to None", value)
+        return None
+
+
 def parse_quantity(value: Optional[str]) -> int:
     if not value:
         return 1
@@ -425,6 +439,139 @@ def parse_pricing_band(value: Optional[str]) -> Optional[Decimal]:
     if numeric_value == UNLIMITED_TIER_SENTINEL:
         return None
     return numeric_value
+
+
+def build_canonical_tiers_from_row(row: Dict[str, str], args) -> List[Dict[str, Decimal]]:
+    tiers_column = args.tiers_column
+    legacy_tiers_raw = row.get(tiers_column)
+    structured_tiers = parse_structured_pricing_tiers(row)
+    canonical_tiers: List[Dict[str, Decimal]] = []
+
+    if structured_tiers:
+        for idx, tier in enumerate(structured_tiers):
+            lower_value = tier.get("lower")
+            if lower_value is None:
+                lower_value = Decimal("0") if idx == 0 else (
+                    canonical_tiers[-1]["upper"] + TIER_INCREMENT
+                    if canonical_tiers[-1]["upper"] is not None
+                    else canonical_tiers[-1]["lower"]
+                )
+                lower_value = lower_value.quantize(PRICING_DECIMAL_PLACES)
+            canonical_tiers.append(
+                {
+                    "lower": lower_value,
+                    "upper": tier.get("upper"),
+                    "rate": tier["rate"],
+                }
+            )
+    else:
+        legacy_tiers = parse_legacy_pricing_tiers(legacy_tiers_raw)
+        if legacy_tiers:
+            lower_band_value = Decimal("0")
+            for legacy_tier in legacy_tiers:
+                upper_value = legacy_tier["upper"]
+                canonical_tiers.append(
+                    {
+                        "lower": lower_band_value,
+                        "upper": upper_value,
+                        "rate": legacy_tier["rate"],
+                    }
+                )
+                if upper_value is None:
+                    break
+                lower_band_value = (upper_value + TIER_INCREMENT).quantize(PRICING_DECIMAL_PLACES)
+
+        if not canonical_tiers:
+            fallback_rate = Decimal(str(parse_rate(row.get(args.rate_column))))
+            canonical_tiers = [
+                {
+                    "lower": Decimal("0"),
+                    "upper": None,
+                    "rate": fallback_rate,
+                }
+            ]
+
+    return canonical_tiers
+
+
+def build_pricing_payloads_from_rows(
+    contract_rate_id: str,
+    currency_code: str,
+    rows_for_group: List[Dict[str, str]],
+    args,
+    *,
+    fallback_start_date: Optional[date] = None,
+    existing_pricing_index: Optional[Dict[Tuple[str, Optional[Decimal], Optional[Decimal]], Dict]] = None,
+    product_name: Optional[str] = None,
+) -> Tuple[List[Dict[str, str]], List[Dict[str, Decimal]], List[Dict[str, Any]]]:
+    pricing_payload_entries: List[Dict[str, str]] = []
+    skipped_existing: List[Dict[str, Any]] = []
+    last_canonical_tiers: List[Dict[str, Decimal]] = []
+
+    for row in rows_for_group:
+        row_effective_date = parse_date(
+            row.get(args.effective_date_column),
+            fallback=parse_date(row.get(args.start_date_column), fallback=fallback_start_date),
+        )
+        row_end_date = parse_optional_date(row.get(args.end_date_column))
+        effective_iso = f"{row_effective_date.isoformat()}T00:00:00.000Z"
+        end_date_iso = f"{row_end_date.isoformat()}T00:00:00.000Z" if row_end_date else None
+
+        canonical_tiers = build_canonical_tiers_from_row(row, args)
+        if canonical_tiers:
+            last_canonical_tiers = canonical_tiers
+
+        tiers_for_creation = list(enumerate(canonical_tiers))
+        tiers_for_creation.sort(key=lambda item: (1 if item[1]["upper"] is None else 0, item[1]["lower"]))
+
+        for index, tier in tiers_for_creation:
+            lower_value = tier["lower"]
+            upper_value = tier["upper"]
+            rate_value = tier["rate"]
+            lower_band_str = format_decimal(lower_value)
+
+            if upper_value is None:
+                upper_band_str = "-1"
+            else:
+                if upper_value < lower_value:
+                    LOGGER.error(
+                        "Tier %d upper quantity (%s) is below lower quantity (%s)%s. Skipping remaining tiers.",
+                        index + 1,
+                        upper_value,
+                        lower_value,
+                        f" for product '{product_name}'" if product_name else "",
+                    )
+                    break
+                upper_band_str = format_decimal(upper_value)
+
+            if existing_pricing_index is not None:
+                existing_key = (currency_code, lower_value, upper_value)
+                existing_entry = existing_pricing_index.get(existing_key)
+                if existing_entry:
+                    LOGGER.info(
+                        "Pricing tier already exists for product '%s' (currency %s, lower %s, upper %s); skipping creation.",
+                        product_name or "",
+                        currency_code,
+                        lower_band_str,
+                        upper_band_str,
+                    )
+                    skipped_existing.append({"existing": existing_entry})
+                    continue
+
+            pricing_entry: Dict[str, str] = {
+                "CurrencyCode": currency_code,
+                "ContractRateId": contract_rate_id,
+                "EffectiveDate": effective_iso,
+                "LowerBand": lower_band_str,
+                "UpperBand": upper_band_str,
+                "Rate": format_decimal(rate_value),
+                "RerateFlag": "0",
+            }
+            if end_date_iso:
+                pricing_entry["EndDate"] = end_date_iso
+            pricing_payload_entries.append(pricing_entry)
+
+    return pricing_payload_entries, last_canonical_tiers, skipped_existing
 
 
 def next_contract_number(api_base: str, session_id: str, base_date: date) -> str:
@@ -757,6 +904,90 @@ def find_pricing_entries(api_base: str, session_id: str, contract_rate_id: str) 
     return response.get("queryResponse", []) or []
 
 
+def lookup_account_id_by_name(api_base: str, session_id: str, account_name: str) -> Optional[str]:
+    if not account_name:
+        return None
+    try:
+        response = perform_lookup(api_base, session_id, build_account_query(account_name))
+    except Exception as exc:
+        LOGGER.error("Account lookup failed for '%s': %s", account_name, exc)
+        return None
+    records = response.get("queryResponse", []) or []
+    if not records:
+        return None
+    return records[0].get("Id") or records[0].get("id")
+
+
+def lookup_contract_id_by_name(
+    api_base: str, session_id: str, contract_name: str, account_id: str, cpq_contract_id: Optional[str] = None
+) -> Optional[str]:
+    if not account_id:
+        return None
+
+    if cpq_contract_id:
+        escaped_cpq = sanitize_value(cpq_contract_id)
+        sql = (
+            "SELECT Id FROM CONTRACT "
+            f"WHERE C_CPQContractId = '{escaped_cpq}' "
+            f"AND AccountId = '{account_id}'"
+        )
+    else:
+        escaped_contract = sanitize_value(contract_name)
+        sql = (
+            "SELECT Id FROM CONTRACT "
+            f"WHERE ContractNumber = '{escaped_contract}' "
+            f"AND AccountId = '{account_id}'"
+        )
+
+    response = perform_lookup(api_base, session_id, sql)
+    records = response.get("queryResponse", []) or []
+    if records:
+        return records[0].get("Id") or records[0].get("id")
+    return None
+
+
+def lookup_contract_rate_id(api_base: str, session_id: str, contract_id: str, product_id: str) -> Optional[str]:
+    sql = (
+        "SELECT Id FROM CONTRACT_RATE "
+        f"WHERE ContractID = '{contract_id}' AND ProductID = '{product_id}'"
+    )
+    response = perform_lookup(api_base, session_id, sql)
+    rows = response.get("queryResponse", []) or []
+    if not rows:
+        return None
+
+    chosen = rows[0]
+    return chosen.get("Id") or chosen.get("id")
+
+
+def fetch_pricing_for_contract_rate(
+    api_base: str, session_id: str, contract_rate_id: str, currency_code: str
+) -> List[Dict]:
+    sql = (
+        "SELECT Id, EffectiveDate, EndDate, LowerBand, UpperBand, Rate "
+        "FROM PRICING "
+        f"WHERE ContractRateId = '{contract_rate_id}' "
+        f"AND CurrencyCode = '{currency_code}' "
+        "ORDER BY EffectiveDate ASC"
+    )
+    response = perform_lookup(api_base, session_id, sql)
+    return response.get("queryResponse", []) or []
+
+
+def update_pricing_record(api_base: str, session_id: str, payload: Dict) -> Dict:
+    wrapped_payload = payload if "brmObjects" in payload else {"brmObjects": payload}
+    base_url = api_base.rstrip("/") + "/"
+    url = urljoin(base_url, "PRICING")
+    return http_put_json(url, wrapped_payload, headers={"sessionId": session_id})
+
+
+def delete_pricing_batch(api_base: str, session_id: str, ids: List[str]) -> Dict:
+    base_url = api_base.rstrip("/") + "/"
+    url = urljoin(base_url, "PRICING/deleteBatch")
+    payload = [{"Id": pid} for pid in ids]
+    return http_post_json(url, payload, headers={"sessionId": session_id})
+
+
 def lookup_contract_id_by_cpq_id(api_base: str, session_id: str, cpq_contract_id: str, account_id: str) -> Optional[str]:
     if not cpq_contract_id:
         return None
@@ -908,7 +1139,6 @@ def main() -> None:
         return process_amendments(rows, args, api_base, session_id)
 
     contract_column = args.contract_group_column
-    tiers_column = args.tiers_column
     rate_only_column = args.rate_only_column
 
     contract_groups: Dict[str, List[Dict[str, str]]] = {}
@@ -1478,109 +1708,15 @@ def main() -> None:
                     key = (entry_currency, lower_band_value, upper_band_value)
                     existing_pricing_index[key] = entry
 
-                for row in pricing_driving_rows:
-                    row_effective_date = parse_date(row.get(args.effective_date_column), fallback=parse_date(row.get(args.start_date_column), fallback=start_date_value))
-                    row_end_date = parse_optional_date(row.get(args.end_date_column))
-                    effective_iso = f"{row_effective_date.isoformat()}T00:00:00.000Z"
-                    end_date_iso = f"{row_end_date.isoformat()}T00:00:00.000Z" if row_end_date else None
-
-                    legacy_tiers_raw = row.get(tiers_column)
-                    structured_tiers = parse_structured_pricing_tiers(row)
-
-                    if structured_tiers:
-                        canonical_tiers = []
-                        for idx, tier in enumerate(structured_tiers):
-                            lower_value = tier.get("lower")
-                            if lower_value is None:
-                                lower_value = Decimal("0") if idx == 0 else (
-                                    canonical_tiers[-1]["upper"] + TIER_INCREMENT
-                                    if canonical_tiers[-1]["upper"] is not None
-                                    else canonical_tiers[-1]["lower"]
-                                )
-                                lower_value = lower_value.quantize(PRICING_DECIMAL_PLACES)
-                            canonical_tiers.append(
-                                {
-                                    "lower": lower_value,
-                                    "upper": tier.get("upper"),
-                                    "rate": tier["rate"],
-                                }
-                            )
-                    else:
-                        legacy_tiers = parse_legacy_pricing_tiers(legacy_tiers_raw)
-                        canonical_tiers = []
-                        if legacy_tiers:
-                            lower_band_value = Decimal("0")
-                            for legacy_tier in legacy_tiers:
-                                upper_value = legacy_tier["upper"]
-                                canonical_tiers.append(
-                                    {
-                                        "lower": lower_band_value,
-                                        "upper": upper_value,
-                                        "rate": legacy_tier["rate"],
-                                    }
-                                )
-                                if upper_value is None:
-                                    break
-                                lower_band_value = (upper_value + TIER_INCREMENT).quantize(PRICING_DECIMAL_PLACES)
-
-                        if not canonical_tiers:
-                            fallback_rate = Decimal(str(parse_rate(row.get(args.rate_column))))
-                            canonical_tiers = [
-                                {
-                                    "lower": Decimal("0"),
-                                    "upper": None,
-                                    "rate": fallback_rate,
-                                }
-                            ]
-
-                    tiers_for_creation = list(enumerate(canonical_tiers))
-                    tiers_for_creation.sort(key=lambda item: (1 if item[1]["upper"] is None else 0, item[1]["lower"]))
-
-                    for index, tier in tiers_for_creation:
-                        lower_value = tier["lower"]
-                        upper_value = tier["upper"]
-                        rate_value = tier["rate"]
-                        lower_band_str = format_decimal(lower_value)
-
-                        if upper_value is None:
-                            upper_band_str = "-1"
-                        else:
-                            if upper_value < lower_value:
-                                LOGGER.error(
-                                    "Tier %d upper quantity (%s) is below lower quantity (%s) for product '%s'. Skipping remaining tiers.",
-                                    index + 1,
-                                    upper_value,
-                                    lower_value,
-                                    product_name,
-                                )
-                                break
-                            upper_band_str = format_decimal(upper_value)
-
-                        existing_key = (product_currency_code, lower_value, upper_value)
-                        existing_entry = existing_pricing_index.get(existing_key)
-                        if existing_entry:
-                            LOGGER.info(
-                                "Pricing tier already exists for product '%s' (currency %s, lower %s, upper %s); skipping creation.",
-                                product_name,
-                                product_currency_code,
-                                lower_band_str,
-                                upper_band_str,
-                            )
-                            skipped_existing.append({"existing": existing_entry})
-                            continue
-
-                        pricing_entry = {
-                            "CurrencyCode": product_currency_code,
-                            "ContractRateId": contract_rate_id,
-                            "EffectiveDate": effective_iso,
-                            "LowerBand": lower_band_str,
-                            "UpperBand": upper_band_str,
-                            "Rate": format_decimal(rate_value),
-                            "RerateFlag": "0",
-                        }
-                        if end_date_iso:
-                            pricing_entry["EndDate"] = end_date_iso
-                        pricing_payload_entries.append(pricing_entry)
+                pricing_payload_entries, canonical_tiers, skipped_existing = build_pricing_payloads_from_rows(
+                    contract_rate_id,
+                    product_currency_code,
+                    pricing_driving_rows,
+                    args,
+                    fallback_start_date=start_date_value,
+                    existing_pricing_index=existing_pricing_index,
+                    product_name=product_name,
+                )
 
             pricing_responses: List[Dict] = []
             if pricing_payload_entries:
@@ -1636,18 +1772,217 @@ def main() -> None:
 
 def process_amendments(rows: List[Dict[str, str]], args, api_base: str, session_id: str) -> None:
     """
-    Process amendment-mode rows. Supports Quantity Change now, Price Change later.
-    Rows execute independently; no grouping by contract.
+    Process amendment-mode rows. Supports Quantity Change and Price Change.
     """
-    for idx, row in enumerate(rows, start=1):
-        action = (row.get(args.action_column) or "").strip().lower()
+    quantity_rows: List[Dict[str, str]] = []
+    price_rows: List[Dict[str, str]] = []
 
+    for row in rows:
+        action = (row.get(args.action_column) or "").strip().lower()
         if action == "quantity change":
-            handle_quantity_change(row, args, api_base, session_id, idx)
+            quantity_rows.append(row)
         elif action == "price change":
-            LOGGER.error("Price Change not implemented yet. Row %s skipped.", idx)
+            price_rows.append(row)
         else:
-            LOGGER.error("Invalid action '%s' in amendment-mode. Row %s skipped.", action, idx)
+            LOGGER.error("Unexpected action '%s' in amendment file.", action)
+
+    if price_rows:
+        process_price_change_amendments(price_rows, args, api_base, session_id)
+
+    if quantity_rows:
+        process_quantity_change_amendments(quantity_rows, args, api_base, session_id)
+
+
+def process_quantity_change_amendments(
+    quantity_rows: List[Dict[str, str]], args, api_base: str, session_id: str
+) -> None:
+    for idx, row in enumerate(quantity_rows, start=1):
+        handle_quantity_change(row, args, api_base, session_id, idx)
+
+
+def process_price_change_amendments(price_rows: List[Dict[str, str]], args, api_base: str, session_id: str) -> None:
+    groups: Dict[Tuple[str, str, str, str, str], List[Dict[str, str]]] = defaultdict(list)
+
+    for row in price_rows:
+        contract_name = (row.get(args.contract_group_column) or "").strip()
+        account_name = (row.get(args.account_column) or "").strip()
+        product_name = (row.get(args.product_column) or "").strip()
+        currency_code = (row.get(args.currency_column) or "").strip()
+        cpq_contract_id = (row.get(args.cpq_contract_id_column) or "").strip()
+
+        key = (contract_name, account_name, product_name, currency_code, cpq_contract_id)
+        groups[key].append(row)
+
+    for key, rows_for_group in groups.items():
+        apply_price_change_for_group(key, rows_for_group, args, api_base, session_id)
+
+
+def apply_price_change_for_group(
+    key: Tuple[str, str, str, str, str],
+    rows_for_group: List[Dict[str, str]],
+    args,
+    api_base: str,
+    session_id: str,
+) -> None:
+    contract_name, account_name, product_name, currency_code, cpq_contract_id = key
+
+    def _sort_key(row: Dict[str, str]) -> date:
+        sortable = row.get(args.effective_date_column) or row.get(args.start_date_column) or ""
+        return parse_iso_to_date(sortable) or date.max
+
+    rows_for_group = sorted(rows_for_group, key=_sort_key)
+
+    if not currency_code:
+        LOGGER.error("Price Change: currency missing for group %s. Skipping.", key)
+        return
+
+    if not cpq_contract_id:
+        LOGGER.error("Price Change: CPQ contract id missing for group %s. Skipping.", key)
+        return
+
+    account_id = lookup_account_id_by_name(api_base, session_id, account_name)
+    if not account_id:
+        LOGGER.error("Price Change: account '%s' not found. Group %s skipped.", account_name, key)
+        return
+
+    contract_id = lookup_contract_id_by_name(api_base, session_id, contract_name, account_id, cpq_contract_id)
+    if not contract_id:
+        LOGGER.error(
+            "Price Change: contract with CPQ id '%s' not found for account '%s'. Group %s skipped.",
+            cpq_contract_id,
+            account_name,
+            key,
+        )
+        return
+
+    product_id = get_product_id(product_name)
+    if not product_id:
+        LOGGER.error("Price Change: product '%s' not found. Group %s skipped.", product_name, key)
+        return
+
+    contract_rate_id = lookup_contract_rate_id(api_base, session_id, contract_id, product_id)
+    if not contract_rate_id:
+        LOGGER.error(
+            "Price Change: no Contract Rate found for contract '%s' and product '%s'. Group %s skipped.",
+            contract_name,
+            product_name,
+            key,
+        )
+        return
+
+    apply_price_changes_to_contract_rate(
+        contract_rate_id, currency_code, rows_for_group, args, api_base, session_id, key
+    )
+
+
+def apply_price_changes_to_contract_rate(
+    contract_rate_id: str,
+    currency_code: str,
+    rows_for_group: List[Dict[str, str]],
+    args,
+    api_base: str,
+    session_id: str,
+    key: Tuple[str, str, str, str, str],
+) -> None:
+    contract_name, account_name, product_name, group_currency, cpq_contract_id = key
+    if not rows_for_group:
+        return
+
+    first_row = rows_for_group[0]
+    first_effective_str = first_row.get(args.effective_date_column) or first_row.get(args.start_date_column)
+    first_effective_date = parse_iso_to_date(first_effective_str)
+    if not first_effective_date:
+        LOGGER.error(
+            "Price Change: invalid effective date '%s' for group %s. Skipping group.",
+            first_effective_str,
+            key,
+        )
+        return
+
+    cut_date = first_effective_date - timedelta(days=1)
+
+    existing_pricing = fetch_pricing_for_contract_rate(api_base, session_id, contract_rate_id, currency_code)
+
+    current_row: Optional[Dict[str, Any]] = None
+    for pr in existing_pricing:
+        eff = parse_iso_to_date(pr.get("EffectiveDate") or pr.get("effectivedate"))
+        end = parse_iso_to_date(pr.get("EndDate") or pr.get("enddate"))
+        if eff and eff <= first_effective_date and (end is None or end >= first_effective_date):
+            current_row = pr
+            break
+
+    if current_row:
+        eff = parse_iso_to_date(current_row.get("EffectiveDate") or current_row.get("effectivedate"))
+        if eff and eff < first_effective_date:
+            update_payload = {
+                "Id": current_row.get("Id") or current_row.get("id"),
+                "EndDate": f"{cut_date.isoformat()}T00:00:00.000Z",
+            }
+            try:
+                update_pricing_record(api_base, session_id, update_payload)
+                LOGGER.info(
+                    "Price Change: shortened pricing %s to end on %s.",
+                    update_payload["Id"],
+                    cut_date.isoformat(),
+                )
+            except Exception as exc:
+                LOGGER.error("Price Change: failed to shorten pricing %s: %s", update_payload["Id"], exc)
+                return
+
+    to_delete_ids: List[str] = []
+    for pr in existing_pricing:
+        eff = parse_iso_to_date(pr.get("EffectiveDate") or pr.get("effectivedate"))
+        if eff and eff >= first_effective_date:
+            pid = pr.get("Id") or pr.get("id")
+            if pid:
+                to_delete_ids.append(pid)
+
+    if to_delete_ids:
+        try:
+            delete_pricing_batch(api_base, session_id, to_delete_ids)
+            LOGGER.info(
+                "Price Change: deleted %d future pricing rows for contract rate %s from %s onward.",
+                len(to_delete_ids),
+                contract_rate_id,
+                first_effective_date.isoformat(),
+            )
+        except Exception as exc:
+            LOGGER.error(
+                "Price Change: failed to delete future pricing rows for contract rate %s: %s",
+                contract_rate_id,
+                exc,
+            )
+            return
+
+    new_payloads, _, _ = build_pricing_payloads_from_rows(
+        contract_rate_id,
+        currency_code,
+        rows_for_group,
+        args,
+        fallback_start_date=first_effective_date,
+        existing_pricing_index=None,
+        product_name=key[2],
+    )
+
+    if new_payloads:
+        try:
+            create_pricing_batch(api_base, session_id, new_payloads)
+            LOGGER.info(
+                "Price Change: created %d new pricing rows for (%s, %s, %s, %s).",
+                len(new_payloads),
+                contract_name,
+                account_name,
+                product_name,
+                currency_code,
+            )
+        except Exception as exc:
+            LOGGER.error(
+                "Price Change: failed to create pricing rows for %s: %s",
+                key,
+                exc,
+            )
+    else:
+        LOGGER.warning("Price Change: no tiers found in CSV for %s; nothing created.", key)
 
 
 def handle_quantity_change(row, args, api_base, session_id, row_number):
