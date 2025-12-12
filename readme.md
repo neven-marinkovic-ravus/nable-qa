@@ -12,6 +12,8 @@ This utility drives the BillingPlatform mock integration using `contract_loader.
   BP_USERNAME=<username>
   BP_PASSWORD=<password>
   ```
+- It's highly recommended that you download a csv table visualizer to turn that hard to read csv into a more Excel like experience. I used the `Edit CSV` extension, which can be found [here](https://marketplace.visualstudio.com/items?itemName=janisdd.vscode-edit-csv). 
+    - You can also download this from the Extensions tab in VS Code or use a different extension that you prefer. 
 
 ## Input CSV
 Each row represents a single product to load on a contract. Rows that share the same `contract` value are placed on the same BillingPlatform contract number and inherit the contract start date from the first row in that group.
@@ -38,31 +40,101 @@ Each row represents a single product to load on a contract. Rows that share the 
 | `contract_rate_only` | optional | When truthy (`true`, `yes`, `1`) the row skips account product creation and only creates/updates the contract rate and pricing tiers. |
 | `pricing_only` | optional | Use if a given account product will have multiple unique pricing segments. See amendment section below. 
 
-## New Sale
+
+## General
+The example tables below represent the values that you would have in your csv. They are formatted as markdown tables in this document for readability. Your actual csv file would look something like this:
 
 Example snippet:
 ```
-contract,account_name,product_name,currency_code,quantity,start_date,effective_date,tier1_from_qty,tier1_to_qty,tier1_rate,tier2_to_qty,tier2_rate,contract_rate_only
-test-001,Pat 2,Subscription - Linked Overage,USD,900,2025-09-30,2025-09-30,0,900,1.65,-1,0,
-test-001,Pat 2,Usage - Node - Tiered,USD,900,2025-09-30,2025-09-30,0,2,0,-1,55,true
+action,contract,CPQ_Contractid,account_name,product_name,bundle_component,currency_code,quantity,start_date,contract_status,account_product_status,rate,effective_date,end_date,tier1_from_qty,tier1_to_qty,tier1_rate,tier2_from_qty,tier2_to_qty,tier2_rate,contract_rate_only,pricing_only
+Create,Contract-A,1,Neven 1.16,UEM N-Sight Basic,,USD,900,2025-09-01,Terminated,Active,1.50,2025-09-01,2025-10-31,0,900.0000000000,1.50,,,,,
+Create,Contract-A,1,Neven 1.16,UEM N-Sight Basic,,USD,900,2025-09-01,Terminated,Active,1.75,2025-11-01,2026-01-31,0,900.0000000000,1.75,,,,,TRUE
+Create,Contract-A,1,Neven 1.16,UEM N-Sight Basic,,USD,900,2025-09-01,Terminated,Active,2.00,2026-02-01,,0,900.0000000000,2.00,,,,,TRUE
 ```
-
-## Amendments
-
-### Quantity Change
-To change the quantity on one of the existing account products, use a structured row like so: 
-|action         |contract  |CPQ_Contractid|account_name|product_name     |bundle_component|currency_code|quantity|start_date|contract_status|account_product_status|rate|effective_date|end_date|tier1_from_qty|tier1_to_qty|tier1_rate|tier2_from_qty|tier2_to_qty|tier2_rate|contract_rate_only|pricing_only|
-|---------------|----------|--------------|------------|-----------------|----------------|-------------|--------|----------|---------------|----------------------|----|--------------|--------|--------------|------------|----------|--------------|------------|----------|------------------|------------|
-|Quantity Change|Contract-A|1             |Neven 1.16  |UEM N-Sight Basic|                |USD          |1000    |2025-09-01|Terminated     |Active                |    |              |        |              |            |          |              |            |          |                  |            |
-
-
-### Price Change
 
 ### Tier Rules
 - Tiers are evaluated in the order provided; the script posts the unlimited (`-1`) tier first to satisfy aggregate pricing grid constraints.
 - When `tierN_from_qty` is empty the script automatically sets it to the previous `tier(N-1)_to_qty + 0.0000000001`.
 - All quantities are managed with high-precision decimals (`0.0000000001` step) to ensure BillingPlatform accepts the ranges.
 - Include an unlimited tier if usage may exceed the last explicit band; otherwise BillingPlatform may reject later updates.
+
+
+## New Sale
+
+### Bundle Parent (Subscription)
+The following highlights a bundle parent (UEM N-Sight Basic) that has three unique pricing segments: 
+- 2025-09-01 to 2025-10-31 at 1.50
+- 2025-11-01 to 2026-01-31 at 1.75
+- 2026-02-01 to at 2.00
+
+Key callouts:
+- Action column is set to Create for all three rows
+- Pricing_Only column is set to TRUE for the second and third row. This is because the first row is used to generate the account product and the first pricing record. While the account product information is present in the second and third row, we only want to create the second and third pricing records. 
+- If you just wanted a singular pricing record, you wouldn't need rows two and three. 
+
+|action|contract  |CPQ_Contractid|account_name|product_name     |bundle_component|currency_code|quantity|start_date|contract_status|account_product_status|rate|effective_date|end_date  |tier1_from_qty|tier1_to_qty  |tier1_rate|tier2_from_qty|tier2_to_qty|tier2_rate|contract_rate_only|pricing_only|
+|------|----------|--------------|------------|-----------------|----------------|-------------|--------|----------|---------------|----------------------|----|--------------|----------|--------------|--------------|----------|--------------|------------|----------|------------------|------------|
+|Create|Contract-A|1             |Neven 1.16  |UEM N-Sight Basic|                |USD          |900     |2025-09-01|Terminated     |Active                |1.50|2025-09-01    |2025-10-31|0             |900.0000000000|1.50      |              |            |          |                  |            |
+|Create|Contract-A|1             |Neven 1.16  |UEM N-Sight Basic|                |USD          |900     |2025-09-01|Terminated     |Active                |1.75|2025-11-01    |2026-01-31|0             |900.0000000000|1.75      |              |            |          |                  |TRUE        |
+|Create|Contract-A|1             |Neven 1.16  |UEM N-Sight Basic|                |USD          |900     |2025-09-01|Terminated     |Active                |2.00|2026-02-01    |          |0             |900.0000000000|2.00      |              |            |          |                  |TRUE        |
+
+
+### Committed Bundle Component (Shared Quantity)
+Since these components get rated at 0 (from their default product rating method), there is no need to specify pricing information. 
+|action|contract  |CPQ_Contractid|account_name|product_name|bundle_component|currency_code|quantity|start_date|contract_status|account_product_status|rate|effective_date|end_date|tier1_from_qty|tier1_to_qty|tier1_rate|tier2_from_qty|tier2_to_qty|tier2_rate|contract_rate_only|pricing_only|
+|------|----------|--------------|------------|------------|----------------|-------------|--------|----------|---------------|----------------------|----|--------------|--------|--------------|------------|----------|--------------|------------|----------|------------------|------------|
+|Create|Contract-A|1             |Neven 1.16  |Node        |TRUE            |USD          |900    |2025-09-01|Terminated     |Active                |    |              |        |              |            |          |              |            |          |                  |            |
+
+Ensure you mark `bundle_component` as **TRUE**.
+
+### Committed Bundle Component (Separate Quantity)
+Although take control is a bundle component, it does not have a `bundle_component` = TRUE value. This is because it needs to be created as an account product and have a contract rate. Also, take note of the different quantity than the examples above and the pricing information.
+
+|action|contract  |CPQ_Contractid|account_name|product_name|bundle_component|currency_code|quantity|start_date|contract_status|account_product_status|rate |effective_date|end_date|tier1_from_qty|tier1_to_qty|tier1_rate|tier2_from_qty|tier2_to_qty|tier2_rate|contract_rate_only|pricing_only|
+|------|----------|--------------|------------|------------|----------------|-------------|--------|----------|---------------|----------------------|-----|--------------|--------|--------------|------------|----------|--------------|------------|----------|------------------|------------|
+|Create|Contract-A|1             |Neven 1.16  |Take Control|            |USD          |2       |2025-09-01|Terminated     |Active                |55.00|2025-09-01    |        |0             |2           |0         |2.01          |-1          |55.00     |                  |            |
+
+### Uncommitted Bundle Component 
+There is also the notion of uncommitted bundle components. These are products that the customer can still be charged for using, but won't be charged if they don't use it. With the committed products, the customer pays a minimum of the commitment (and overage if they go over). As a result, we want to JUST create a contract rate for this uncommitted component. 
+
+|action|contract  |CPQ_Contractid|account_name|product_name|bundle_component|currency_code|quantity|start_date|contract_status|account_product_status|rate |effective_date|end_date|tier1_from_qty|tier1_to_qty|tier1_rate|tier2_from_qty|tier2_to_qty|tier2_rate|contract_rate_only|pricing_only|
+|------|----------|--------------|------------|------------|----------------|-------------|--------|----------|---------------|----------------------|-----|--------------|--------|--------------|------------|----------|--------------|------------|----------|------------------|------------|
+|Create|Contract-A|1             |Neven 1.16  |Web Monitor |                |USD          |2       |2025-09-01|Terminated     |Active                |10.50|2025-09-01    |        |              |            |          |              |            |10.50     |TRUE                  |        |
+
+
+### Bundle Overage
+Bundle overage products (formula) are meant to capture the amount that a customer goes over their provisioned quantity with their committed bundle components. In the example's above, UEM N-Sight Basic is the parent subscription for the bundle It has a quantity of 900. The committed bundle components (Node in this case) share that quantity. If Node goes over 900 in a month, overage is charged. The exact overage formula is still in-flight, but this captures the essence. 
+
+|action|contract  |CPQ_Contractid|account_name|product_name|bundle_component|currency_code|quantity|start_date|contract_status|account_product_status|rate|effective_date|end_date  |tier1_from_qty|tier1_to_qty|tier1_rate|tier2_from_qty|tier2_to_qty|tier2_rate|contract_rate_only|pricing_only|
+|------|----------|--------------|------------|------------|----------------|-------------|--------|----------|---------------|----------------------|----|--------------|----------|--------------|------------|----------|--------------|------------|----------|------------------|------------|
+|Create|Contract-A|1             |Neven 40    |UEM Basic N-Sight Overage|                |USD          |        |2026-01-01|Terminated     |Active                |1.85|2026-01-01    |2026-01-31|              |            |          |              |            |          |                  |            |
+|Create|Contract-A|1             |Neven 40    |UEM Basic N-Sight Overage|                |USD          |        |2026-01-01|Terminated     |Active                |2.00|2026-02-01    |          |              |            |          |              |            |          |                  |TRUE        |
+
+No tiered pricing in this example, just two unique pricing segments. 
+
+## Amendments
+
+### Quantity Change
+To change the quantity on one of the existing account products, use the `Quantity Change` action type. This example shows the UEM N-Sight Basic product getting it's quantity set to 1000. There is no pricing information because none is needed for this quantity change.
+|action         |contract  |CPQ_Contractid|account_name|product_name     |bundle_component|currency_code|quantity|start_date|contract_status|account_product_status|rate|effective_date|end_date|tier1_from_qty|tier1_to_qty|tier1_rate|tier2_from_qty|tier2_to_qty|tier2_rate|contract_rate_only|pricing_only|
+|---------------|----------|--------------|------------|-----------------|----------------|-------------|--------|----------|---------------|----------------------|----|--------------|--------|--------------|------------|----------|--------------|------------|----------|------------------|------------|
+|Quantity Change|Contract-A|1             |Neven 1.16  |UEM N-Sight Basic|                |USD          |1000    |2025-09-01|Terminated     |Active                |    |              |        |              |            |          |              |            |          |                  |            |
+
+### Price Change
+The setup here is very similar to the setup done for the UEM N-Sight Basic creation. Ensure that action = `Price Change`. The price changing sequence is as follows:
+1. The contract rate and pricing records for a account product are located
+2. The "current" pricing record (record that includes the effective date of the first row in your orders.csv) gets it's end date updated/set to the effective date - 1 of the first pricing record in your csv
+3. Any records that existed after that now updated pricing record are deleted 
+4. All pricing records specified in the orders.csv are then created. 
+
+The script treats the pricing rows you provide as the source of truth. Pricing records that have already occurred are not touched. 
+
+|action|contract  |CPQ_Contractid|account_name|product_name|bundle_component|currency_code|quantity|start_date|contract_status|account_product_status|rate|effective_date|end_date  |tier1_from_qty|tier1_to_qty  |tier1_rate|tier2_from_qty|tier2_to_qty|tier2_rate|contract_rate_only|pricing_only|
+|------|----------|--------------|------------|------------|----------------|-------------|--------|----------|---------------|----------------------|----|--------------|----------|--------------|--------------|----------|--------------|------------|----------|------------------|------------|
+|Price Change|Contract-A|1             |Neven 1.16  |UEM N-Sight Basic|                |USD          |900     |2025-09-01|Terminated     |Active                |1.50|2025-09-01    |2025-10-31|0             |900.0000000000|1.50      |              |            |          |                  |            |
+|Price Change|Contract-A|1             |Neven 1.16  |UEM N-Sight Basic|                |USD          |900     |2025-09-01|Terminated     |Active                |1.75|2025-11-01    |2026-01-31|0             |900.0000000000|1.75      |              |            |          |                  |TRUE        |
+|Price Change|Contract-A|1             |Neven 1.16  |UEM N-Sight Basic|                |USD          |900     |2025-09-01|Terminated     |Active                |2.00|2026-02-01    |          |0             |900.0000000000|2.00      |              |            |          |                  |TRUE        |
+
 
 ## Execution Flow
 For each contract group the workflow performs:
