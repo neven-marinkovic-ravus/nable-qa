@@ -1006,20 +1006,32 @@ def delete_pricing_batch(api_base: str, session_id: str, ids: List[str]) -> Dict
     return http_delete_json(url, payload, headers={"sessionId": session_id})
 
 
-def lookup_contract_id_by_cpq_id(api_base: str, session_id: str, cpq_contract_id: str, account_id: str) -> Optional[str]:
+def lookup_contract_id_by_cpq_id(
+    api_base: str,
+    session_id: str,
+    cpq_contract_id: str,
+    account_id: str,
+) -> Tuple[Optional[str], Optional[str]]:
     if not cpq_contract_id:
-        return None
+        return None, None
     escaped_cpq_id = sanitize_value(cpq_contract_id)
     sql = (
-        "SELECT Id FROM CONTRACT "
+        "SELECT Id, StartDate FROM CONTRACT "
         f"WHERE C_CPQContractId = '{escaped_cpq_id}' "
         f"AND AccountId = '{account_id}'"
     )
     response = perform_lookup(api_base, session_id, sql)
     records = response.get("queryResponse", []) or []
     if records:
-        return records[0].get("Id")
-    return None
+        record = records[0]
+        contract_id = record.get("Id") or record.get("id")
+        start_date_value = (
+            record.get("StartDate")
+            or record.get("startdate")
+            or record.get("Startdate")
+        )
+        return contract_id, start_date_value
+    return None, None
 
 
 def get_account_product(api_base: str, session_id: str, account_product_id: str) -> List[Dict]:
@@ -1141,7 +1153,7 @@ def main() -> None:
 
     actions = {(row.get(args.action_column) or "").strip().lower() for row in rows}
     create_actions = {"", "create"}
-    amend_actions = {"quantity change", "price change"}
+    amend_actions = {"quantity change", "price change", "quantity and price change"}
 
     if (actions & create_actions) and (actions & amend_actions):
         raise SystemExit(
@@ -1150,7 +1162,8 @@ def main() -> None:
         )
 
     is_amendment_file = all(
-        (row.get(args.action_column) or "").strip().lower() in {"quantity change", "price change"}
+        (row.get(args.action_column) or "").strip().lower()
+        in {"quantity change", "price change", "quantity and price change"}
         for row in rows
     )
     if is_amendment_file:
@@ -1790,25 +1803,39 @@ def main() -> None:
 
 def process_amendments(rows: List[Dict[str, str]], args, api_base: str, session_id: str) -> None:
     """
-    Process amendment-mode rows. Supports Quantity Change and Price Change.
+    Dispatch amendment rows by action type.
+
+    Supports:
+      - 'Quantity Change'
+      - 'Price Change'
+      - 'Quantity and Price Change'  (does both, quantity first)
     """
     quantity_rows: List[Dict[str, str]] = []
     price_rows: List[Dict[str, str]] = []
 
     for row in rows:
         action = (row.get(args.action_column) or "").strip().lower()
+
         if action == "quantity change":
             quantity_rows.append(row)
+
         elif action == "price change":
             price_rows.append(row)
+
+        elif action == "quantity and price change":
+            LOGGER.info("Row flagged for both quantity and price change.")
+            quantity_rows.append(row)
+            price_rows.append(row)
+
         else:
-            LOGGER.error("Unexpected action '%s' in amendment file.", action)
+            LOGGER.error("Unexpected action '%s' in amendment file; row skipped.", action)
+
+    # Quantity first, then price.
+    if quantity_rows:
+        process_quantity_change_amendments(quantity_rows, args, api_base, session_id)
 
     if price_rows:
         process_price_change_amendments(price_rows, args, api_base, session_id)
-
-    if quantity_rows:
-        process_quantity_change_amendments(quantity_rows, args, api_base, session_id)
 
 
 def process_quantity_change_amendments(
@@ -2030,9 +2057,16 @@ def handle_quantity_change(row, args, api_base, session_id, row_number):
         LOGGER.error("Row %s: missing CPQ contract id. Skipping row.", row_number)
         return
 
-    contract_id = lookup_contract_id_by_cpq_id(api_base, session_id, cpq_contract_id, account_id)
+    contract_id, contract_start_date = lookup_contract_id_by_cpq_id(api_base, session_id, cpq_contract_id, account_id)
     if not contract_id:
         LOGGER.error("Row %s: contract with CPQ id '%s' not found. Skipping row.", row_number, cpq_contract_id)
+        return
+    if not contract_start_date:
+        LOGGER.error(
+            "Row %s: contract '%s' missing start date; cannot set ContractModificationDate. Skipping row.",
+            row_number,
+            contract_id,
+        )
         return
 
     product_id = get_product_id(product_name)
@@ -2066,7 +2100,11 @@ def handle_quantity_change(row, args, api_base, session_id, row_number):
         )
         return
 
-    payload = {"Id": ap_id, "Quantity": str(new_quantity)}
+    payload = {
+        "Id": ap_id,
+        "Quantity": str(new_quantity),
+        "ContractModificationDate": contract_start_date,
+    }
     base_url = api_base.rstrip("/") + "/"
     update_url = urljoin(base_url, f"ACCOUNT_PRODUCT/{ap_id}")
     LOGGER.info(
